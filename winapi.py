@@ -140,6 +140,8 @@ _sig(gdi32, "Rectangle", w.BOOL, w.HDC, i, i, i, i)
 _sig(gdi32, "Ellipse", w.BOOL, w.HDC, i, i, i, i)
 _sig(gdi32, "RoundRect", w.BOOL, w.HDC, i, i, i, i, i, i)
 _sig(gdi32, "PolyBezier", w.BOOL, w.HDC, P(w.POINT), w.DWORD)
+_sig(gdi32, "GetPixel", w.DWORD, w.HDC, i, i)
+_sig(user32, "FillRect", i, w.HDC, P(w.RECT), w.HANDLE)
 _sig(gdi32, "SetBkMode", i, w.HDC, i)
 _sig(gdi32, "SetTextColor", w.DWORD, w.HDC, w.DWORD)
 _sig(gdi32, "CreateFontW", w.HANDLE, i, i, i, i, i, w.DWORD, w.DWORD, w.DWORD, w.DWORD,

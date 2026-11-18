@@ -4,9 +4,14 @@ Lancer       : pythonw anticroissantage.py
 Test sûr     : python anticroissantage.py --timeout 20 --nolock
 Déverrouiller: AltGr + H (verrouille ensuite vraiment la session Windows)
 
-Le script photographie l'écran, l'affiche en plein écran, et avale clavier et clics.
-Le curseur bouge, la vraie barre des tâches est recopiée (horloge à jour) et le menu
-Démarrer est un miroir du vrai. Un clic affiche un paquet « Ceci n'est pas une clope ».
+Le script affiche le vrai bureau en direct (recopié ~20 fois par seconde) en plein écran,
+et avale clavier et clics : vidéo, horloge et fenêtres continuent de bouger, mais rien ne répond.
+Le curseur bouge, le menu Démarrer est un miroir du vrai. Un clic affiche un paquet
+« Ceci n'est pas une clope ».
+
+Options : --fige (photo figée au lieu du direct, seules la barre des tâches et le menu bougent),
+          --fps N (images par seconde en direct, 20 par défaut), --mesure (affiche images/s et CPU à la fin),
+          --timeout N (déverrouille seul après N s), --nolock (ne verrouille pas la session).
 """
 import base64
 import ctypes
@@ -37,13 +42,14 @@ MESSAGES = ["Ça sert à rien de cliquer.", "Elle arrivera pas, ta clope.", "Tou
 # État du verrouillage (une seule instance du programme)
 s = SimpleNamespace(
     wins={},            # fenêtre -> (décalage x, y) de son écran dans l'image
-    mem=None,           # photo de l'écran (la barre des tâches y est rafraîchie)
+    mem=None,           # image du bureau : photo figée, ou recopie en direct du vrai bureau
     live=None,          # copie en direct du vrai menu Démarrer
     frame=None,         # image composée avant affichage (évite le scintillement)
     taskbars=[],        # rectangles des barres des tâches
     panel=None,         # le paquet affiché : SimpleNamespace(rc, message, burn, dc)
     panel_until=0, msg_i=0, particles=[], puff=None, tick=0,
     menu=False, menu_t=0, start_rect=None, mirror_ok=True,
+    live_on=False, fps=20, next_grab=0, frames=0, grab_s=0.0,   # mode en direct et mesures
     altgr=False, keys_down=set(), unlock_lock=True, deadline=0, arrow=None, hinst=None)
 stats = SimpleNamespace(clicks=0, keys=0, menus=0, smoked=0, first=None, last=None)
 
@@ -94,6 +100,18 @@ def capture():
     screen = user32.GetDC(None)
     gdi32.BitBlt(s.mem, 0, 0, W, H, screen, X, Y, SRCCOPY | CAPTUREBLT)
     user32.ReleaseDC(None, screen)
+
+
+def grab_desktop():
+    """Mode en direct : recopie le vrai bureau (sous nos fenêtres, exclues des captures) dans s.mem."""
+    t0 = time.perf_counter()
+    screen = user32.GetDC(None)
+    gdi32.BitBlt(s.mem, 0, 0, W, H, screen, X, Y, SRCCOPY)  # sans CAPTUREBLT : plus rapide, sans scintillement du curseur
+    user32.ReleaseDC(None, screen)
+    s.frames += 1
+    s.grab_s += time.perf_counter() - t0
+    for hwnd in list(s.wins):
+        user32.InvalidateRect(hwnd, None, False)
 
 
 def refresh_taskbars():
@@ -245,13 +263,17 @@ def smoke_step():
             invalidate(rc)
 
 
+def has_overlay():
+    return bool(s.panel or s.particles or (s.menu and not s.live_on))
+
+
 def compose(zone):
     """Compose la zone (coordonnées de l'image) dans s.frame : photo, menu, paquet, fumée."""
     f = s.frame
     saved = gdi32.SaveDC(f)
     gdi32.IntersectClipRect(f, zone.left, zone.top, zone.right, zone.bottom)
     gdi32.BitBlt(f, 0, 0, W, H, s.mem, 0, 0, SRCCOPY)
-    if s.menu:
+    if s.menu and not s.live_on:  # en direct, le vrai menu est déjà dans s.mem
         mr = menu_rect()
         gdi32.BitBlt(f, mr.left, mr.top, mr.right - mr.left, mr.bottom - mr.top, s.live, 0, 0, SRCCOPY)
     if s.panel:
@@ -331,7 +353,9 @@ def slow_step():
     for hwnd in list(s.wins):
         user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x2 | 0x1 | 0x10)  # HWND_TOPMOST, sans bouger
     user32.SetCursor(s.arrow)
-    if s.menu:
+    if s.live_on:
+        pass  # le bureau entier est déjà recopié en direct
+    elif s.menu:
         mr = menu_rect()
         screen = user32.GetDC(None)
         gdi32.BitBlt(s.live, 0, 0, mr.right - mr.left, mr.bottom - mr.top, screen, mr.left + X, mr.top + Y, SRCCOPY)
@@ -353,8 +377,11 @@ def window_proc(hwnd, msg, wp, lp):
         ox, oy = s.wins.get(hwnd, (0, 0))
         r = ps.rcPaint
         zone = w.RECT(r.left + ox, r.top + oy, r.right + ox, r.bottom + oy)
-        compose(zone)
-        gdi32.BitBlt(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, s.frame, zone.left, zone.top, SRCCOPY)
+        source = s.mem
+        if has_overlay():  # sinon on évite une copie : s.mem va directement à l'écran
+            compose(zone)
+            source = s.frame
+        gdi32.BitBlt(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, source, zone.left, zone.top, SRCCOPY)
         user32.EndPaint(hwnd, ctypes.byref(ps))
         return 0
     if msg == WM_ERASEBKGND:
@@ -362,8 +389,11 @@ def window_proc(hwnd, msg, wp, lp):
     if msg == WM_SETCURSOR:  # toujours la flèche normale
         user32.SetCursor(s.arrow)
         return 1
-    if msg == WM_TIMER:  # ~30 images/s
+    if msg == WM_TIMER:  # ~30 fois/s
         s.tick += 1
+        if s.live_on and time.perf_counter() >= s.next_grab:
+            s.next_grab = time.perf_counter() + 1 / s.fps
+            grab_desktop()
         smoke_step()
         if s.tick % 3 == 0:
             slow_step()
@@ -449,9 +479,17 @@ def show_scoreboard():
 
 # --- Programme ----------------------------------------------------------------------------------------
 
+def option(name, default):
+    """Valeur numérique qui suit --name dans la ligne de commande."""
+    return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+
 def main():
+    s.live_on = "--fige" not in sys.argv
+    s.fps = max(option("--fps", 20), 1)
+    t_start, cpu_start = time.perf_counter(), time.process_time()
     if "--timeout" in sys.argv:  # filet de sécurité pour tester : déverrouille tout seul
-        s.deadline = now() + int(sys.argv[sys.argv.index("--timeout") + 1]) * 1000
+        s.deadline = now() + option("--timeout", 15) * 1000
     s.hinst = kernel32.GetModuleHandleW(None)
     s.arrow = user32.LoadCursorW(None, 32512)  # IDC_ARROW
     s.puff = clope.bouffee()
@@ -473,6 +511,11 @@ def main():
     for hook in hooks:
         user32.UnhookWindowsHookEx(hook)
 
+    if "--mesure" in sys.argv:
+        secs = time.perf_counter() - t_start
+        print(f"{s.frames} images en {secs:.1f} s = {s.frames / secs:.1f} images/s, "
+              f"CPU {100 * (time.process_time() - cpu_start) / secs:.1f} % d'un coeur, "
+              f"capture {1000 * s.grab_s / max(s.frames, 1):.1f} ms/image")
     if s.unlock_lock:
         user32.LockWorkStation()
         wait_for_unlock()
